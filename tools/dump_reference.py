@@ -5,8 +5,7 @@
     python tools/dump_reference.py --model gpt2 --out tests/data
 
 Every kernel in nano-infer gets validated against the tensor this script saves
-for the matching sub-module. Without it you find out your GEMM is wrong twelve
-files later, with no way to tell which layer introduced the error.
+for the matching sub-module.
 
 Determinism matters more than realism here. The prompt is fixed, dropout is off
 in eval mode, and the model runs under no_grad on CPU in float32. Run this on
@@ -143,17 +142,24 @@ def dump(model_name: str, out_dir: Path, prompt: str, layer_spec: str) -> None:
 
     save("tokens", input_ids.to(torch.float32).numpy())
 
-    # The embedding sum is not a module, so reconstruct it. This is the input to
-    # your very first LayerNorm and the one tensor a hook cannot reach.
     with torch.no_grad():
         positions = torch.arange(n_tokens, dtype=torch.long).unsqueeze(0)
         embedded = model.transformer.wte(input_ids) + model.transformer.wpe(positions)
     save("embed.out", to_array(embedded))
 
+    module_by_name = dict(hooked_modules(model, layers))
     for name, (inputs, output) in captured.items():
         if inputs:
             save(f"{name}.in", to_array(inputs[0]))
         save(f"{name}.out", to_array(output))
+
+        # LayerNorm gamma and beta, so the kernel test needs only this dump and
+        # not the exported checkpoint as well. Restricted to LayerNorm on
+        # purpose: a Conv1D weight is 7 MiB and already lives in the .bin.
+        module = module_by_name.get(name)
+        if isinstance(module, torch.nn.LayerNorm):
+            save(f"{name}.gamma", to_array(module.weight))
+            save(f"{name}.beta", to_array(module.bias))
 
     # Attention probabilities, post-softmax and post-mask, shaped
     # [batch, heads, query, key]. The single most useful tensor for debugging a
