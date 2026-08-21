@@ -1,4 +1,6 @@
 // nano-infer: model configuration and checkpoint format constants.
+//
+// tools/export_gpt2.py writes the format described here. 
 
 #pragma once
 
@@ -36,6 +38,10 @@ inline const char* dtype_name(DType dt) {
   }
   return "unknown";
 }
+
+// HuggingFace GPT2Config.layer_norm_epsilon. Not a free parameter: change it
+// and the logits stop matching the reference.
+constexpr float kLayerNormEps = 1e-5f;
 
 struct GPT2Config {
   std::uint32_t n_layer = 0;
