@@ -15,3 +15,4 @@ function(nanoinfer_add_test name source)
 endfunction()
 
 nanoinfer_add_test(test_weights test_weights.cpp)
+nanoinfer_add_test(test_layernorm test_layernorm.cu)
