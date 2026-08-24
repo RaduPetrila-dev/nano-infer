@@ -36,12 +36,17 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-CMake targets the GPU in the build machine by default. Override for a portable
-binary:
+CMake targets the GPU in the build machine by default. `native` queries the
+device, so on a machine without one, a compile-only check needs an explicit
+architecture:
 
 ```bash
-cmake -B build -DCMAKE_CUDA_ARCHITECTURES="86;89;90"
+cmake -B build -DCMAKE_CUDA_ARCHITECTURES="86;89;90"   # portable binary
+cmake -B build -DCMAKE_CUDA_ARCHITECTURES=75           # compile check, no GPU present
 ```
+
+A Codespace can generate reference data, export weights, and compile. It cannot
+run the tests, since Codespaces have no GPU.
 
 Options:
 
@@ -56,10 +61,14 @@ time instead of during a profiler session.
 ## Weights
 
 ```bash
-pip install torch transformers numpy
+pip install --index-url https://download.pytorch.org/whl/cpu torch
+pip install -r requirements.txt
 python tools/export_gpt2.py --model gpt2 --out weights/gpt2-124m-f32.bin
 ./build/nano-infer weights/gpt2-124m-f32.bin
 ```
+
+The CPU-only torch wheel is deliberate. Weight export and the reference dump both
+run on CPU, and the default wheel bundles a 2.5 GB NVIDIA runtime neither needs.
 
 ## Reference data
 
