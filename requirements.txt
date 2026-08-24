@@ -1,0 +1,12 @@
+# Host-side tooling only. Nothing here is needed to build or run the engine,
+# which links against the CUDA runtime and nothing else.
+#
+# Install the CPU-only torch wheel unless you are on a machine with a GPU:
+#   pip install --index-url https://download.pytorch.org/whl/cpu torch
+#   pip install -r requirements.txt
+#
+# The default torch wheel bundles the NVIDIA runtime, around 2.5 GB, which is
+# wasted on a CPU-only box. The reference dump runs on CPU by design.
+numpy>=1.24
+torch>=2.0
+transformers>=4.30
