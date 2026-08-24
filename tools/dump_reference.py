@@ -5,7 +5,8 @@
     python tools/dump_reference.py --model gpt2 --out tests/data
 
 Every kernel in nano-infer gets validated against the tensor this script saves
-for the matching sub-module.
+for the matching sub-module. Without it you find out your GEMM is wrong twelve
+files later, with no way to tell which layer introduced the error.
 
 Determinism matters more than realism here. The prompt is fixed, dropout is off
 in eval mode, and the model runs under no_grad on CPU in float32. Run this on
@@ -142,6 +143,8 @@ def dump(model_name: str, out_dir: Path, prompt: str, layer_spec: str) -> None:
 
     save("tokens", input_ids.to(torch.float32).numpy())
 
+    # The embedding sum is not a module, so reconstruct it. This is the input to
+    # your very first LayerNorm and the one tensor a hook cannot reach.
     with torch.no_grad():
         positions = torch.arange(n_tokens, dtype=torch.long).unsqueeze(0)
         embedded = model.transformer.wte(input_ids) + model.transformer.wpe(positions)
