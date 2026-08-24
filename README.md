@@ -15,7 +15,7 @@ baseline is not a measurement.
 | Checkpoint format and loader | done |
 | Reference harness against HuggingFace | done |
 | Device reduction and vector primitives | done |
-| LayerNorm | in progress |
+| LayerNorm, naive | in progress |
 | GELU, embedding, residual | not started |
 | GEMM, naive | not started |
 | Attention, unfused | not started |
@@ -94,7 +94,7 @@ src/                     implementation, kernels/ holds the .cu files
 tests/                   npy.hpp, reference.hpp, one test per kernel
 tools/                   export_gpt2.py, dump_reference.py
 bench/                   microbenchmarks and tokens per second
-docs/                    format notes and profiling findings
+docs/                    kernels.md holds the design and numerical notes
 ```
 
 Headers mirror sources one to one. `.cuh` means the file contains device code or
@@ -139,6 +139,9 @@ HuggingFace GPT-2 uses `Conv1D`, which stores weights as
 GEMM computing `C[M, N] = A[M, K] * B[K, N]`, so the exporter writes weights
 untransposed and the kernels consume them directly. Nothing is transposed
 anywhere in this repo.
+
+Kernel sources carry why-only comments. The maths, the numerical traps, the
+block configuration and the optimisation ladder live in `docs/kernels.md`.
 
 ## Numerical tolerances
 
