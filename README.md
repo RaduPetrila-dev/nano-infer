@@ -15,9 +15,9 @@ baseline is not a measurement.
 | Checkpoint format and loader | done |
 | Reference harness against HuggingFace | done |
 | Device reduction and vector primitives | done |
-| LayerNorm, naive | in progress |
-| GELU, embedding, residual | not started |
-| GEMM, naive | not started |
+| LayerNorm, naive | done |
+| GELU, embedding, residual | done |
+| GEMM, naive | next |
 | Attention, unfused | not started |
 | End-to-end logit parity with HuggingFace | not started |
 | BPE tokeniser | not started |
@@ -90,6 +90,12 @@ when a bug appears halfway.
 The data is gitignored. Tests that need it exit 77, which `ctest` records as a
 skip rather than a failure, so a fresh clone is never red.
 
+Some kernels get parity for free from tensors the dump already holds. GELU is
+checked by running `h.0.mlp.fc.out` through the kernel and comparing against
+`h.0.mlp.proj.in`, which is post-activation by construction. Embedding has no
+parity case yet, because the dump saves LayerNorm gamma and beta but not `wte`
+or `wpe`. It arrives with the end-to-end test, which loads the checkpoint.
+
 ## Layout
 
 ```
@@ -99,6 +105,10 @@ include/nanoinfer/       public interface of the static library
   weights.hpp            loader interface
   device_ops.cuh         warp and block reductions, vectorised access
   kernels/               launcher declarations
+    layernorm.cuh
+    gelu.cuh
+    embedding.cuh
+    residual.cuh
 src/                     implementation, kernels/ holds the .cu files
 tests/                   npy.hpp, reference.hpp, one test per kernel
 tools/                   export_gpt2.py, dump_reference.py
@@ -152,6 +162,23 @@ anywhere in this repo.
 Kernel sources carry why-only comments. The maths, the numerical traps, the
 block configuration and the optimisation ladder live in `docs/kernels.md`.
 
+## Activation
+
+`GPT2Config.activation_function` is `gelu_new`, the tanh approximation, not the
+erf definition. The two forms differ by up to 4.7e-4 absolute at `|x| = 2.7`,
+which is 99 times the tolerance the GELU test allows and about 900 times the raw
+elementwise budget. Substituting one for the other produces a kernel that is
+correct in the abstract and wrong here.
+
+## Aliasing
+
+Elementwise kernels run in place. LayerNorm normalises the residual stream over
+itself, GELU overwrites the MLP intermediate, and the residual add writes back
+into the stream it read. None of those kernels marks its pointers `__restrict__`,
+because a restrict-qualified pointer promises the compiler no other pointer
+writes the same object, and an in-place launch breaks the promise. All three are
+bandwidth bound, so the qualifier buys close to nothing.
+
 ## Numerical tolerances
 
 Tolerances come from fp32 error analysis, not from whatever made the test pass.
@@ -166,7 +193,15 @@ The mantissa is 24 bits, and summing K products accumulates rounding roughly as
 | Logits | 2e-4 | the whole stack, twelve blocks deep |
 
 These are ceilings for a correct kernel. A kernel that needs a looser tolerance
-is wrong.
+than the derived floor for its inputs is wrong.
+
+The elementwise row is a ceiling and not a floor. Where the fp32 error floor sits
+above it, the test derives the tolerance from the input instead of relaxing the
+number until the test goes green. Two kernels reach that point. LayerNorm at
+large mean has a floor of `eps * |centre| * sqrt(N) / spread`, about 6.6e-3 at
+centre 4000. GELU in the negative tail has a floor of `|x| * 2^-24`, which is
+2.4e-7 at x = -4 against a value of 7.0e-5. Both derivations live in the test
+that uses them, with the reasoning in `docs/kernels.md`.
 
 Comparison uses `|a - e| <= absolute + relative * |e|`, the same mixed criterion
 as `numpy.allclose`. Pure relative error explodes near zero and post-LayerNorm
