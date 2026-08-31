@@ -16,3 +16,6 @@ endfunction()
 
 nanoinfer_add_test(test_weights test_weights.cpp)
 nanoinfer_add_test(test_layernorm test_layernorm.cu)
+nanoinfer_add_test(test_gelu test_gelu.cu)
+nanoinfer_add_test(test_embedding test_embedding.cu)
+nanoinfer_add_test(test_residual test_residual.cu)
