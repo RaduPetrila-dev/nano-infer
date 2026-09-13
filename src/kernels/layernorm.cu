@@ -7,16 +7,16 @@
 #include "nanoinfer/config.hpp"
 #include "nanoinfer/cuda_utils.hpp"
 #include "nanoinfer/device_ops.cuh"
+#include "nanoinfer/launch.cuh"
 
 namespace nanoinfer {
 namespace {
 
 constexpr int kReduceSlots = 32;  // one slot per warp at the 1024-thread maximum
 
-// out may alias in. Each thread reads row_in[c] before writing row_out[c], and
-// no thread reads a column another thread writes.
-__global__ void layernorm_kernel(float* __restrict__ out,
-                                 const float* __restrict__ in,
+// out aliases in on every in-place normalise, so neither carries __restrict__.
+// gamma and beta keep it: the contract forbids them aliasing out.
+__global__ void layernorm_kernel(float* out, const float* in,
                                  const float* __restrict__ gamma,
                                  const float* __restrict__ beta, int cols,
                                  float eps) {
@@ -55,6 +55,8 @@ __global__ void layernorm_kernel(float* __restrict__ out,
   // instruction but about 2 ulp, which eats half the 5e-7 elementwise budget.
   const float inv_std = 1.0f / sqrtf(variance + eps);
 
+  // Each thread reads row_in[c] before writing row_out[c], and no thread reads a
+  // column another thread writes.
   for (int c = threadIdx.x; c < cols; c += blockDim.x) {
     row_out[c] = (row_in[c] - mean) * inv_std * gamma[c] + beta[c];
   }
@@ -62,13 +64,7 @@ __global__ void layernorm_kernel(float* __restrict__ out,
 
 }  // namespace
 
-int layernorm_block_size(int cols) {
-  // 256 divides 768 evenly at 3 elements per thread. 1024 leaves threads idle,
-  // 128 halves the warps available to hide memory latency.
-  if (cols >= 256) return 256;
-  const int rounded = ceil_div(cols, kWarpSize) * kWarpSize;
-  return rounded < kWarpSize ? kWarpSize : rounded;
-}
+int layernorm_block_size(int cols) { return row_block_size(cols); }
 
 void layernorm_forward(float* out, const float* in, const float* gamma,
                        const float* beta, int rows, int cols, float eps,
