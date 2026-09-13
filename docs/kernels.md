@@ -296,3 +296,145 @@ so no pointer carries `__restrict__`.
 
 Only the last two matter. The float4 row exists to confirm the kernel was already
 bandwidth limited.
+
+## GEMM
+
+```
+C[m, n] = A[m, k] * B[k, n] + bias[n]
+```
+
+Four calls per transformer block, and every weight in the model except `wte`
+passes through one of them.
+
+| Call | m | k | n |
+| --- | --- | --- | --- |
+| `attn.qkv` | tokens | 768 | 2304 |
+| `attn.proj` | tokens | 768 | 768 |
+| `mlp.fc` | tokens | 768 | 3072 |
+| `mlp.proj` | tokens | 3072 | 768 |
+
+### Nothing transposes
+
+HuggingFace GPT-2 stores every projection as `Conv1D`, which holds its weight as
+`[in_features, out_features]` and computes `y = x @ W`. A row-major
+`C[m, n] = A[m, k] * B[k, n]` wants exactly that, so the exporter writes the
+weight untransposed and the kernel reads it as `B` directly.
+
+This is the one property a synthetic test cannot check. A generated case writes
+whatever layout it then reads back, so a kernel that transposed both the write
+and the read would pass every shape in the file. The parity cases exist for this
+alone: real layer 0 activations, real layer 0 weights, compared against what the
+`Conv1D` produced. Run `tools/dump_reference.py --dump-weights` to enable them.
+
+### Thread mapping
+
+One thread per output element, a 32 by 8 block tile.
+
+32 columns wide is the load that matters. Lane `i` of a warp computes column
+`col0 + i` of the same output row, so on every step of the reduction the 32 lanes
+read 32 consecutive floats of one `B` row. That is 128 bytes, one transaction.
+Any other tile width splits it into two.
+
+The `A` access is the mirror case. Every thread in the warp shares a row, so all
+32 lanes read the same address and the load broadcasts rather than costing
+bandwidth. Eight rows of tile stack eight warps and reach the 256 threads every
+other kernel here uses.
+
+The grid rounds up to whole tiles, so edge blocks carry threads with no output.
+They return immediately. No barrier follows the guard, which is what makes the
+early return legal here and illegal in LayerNorm.
+
+### Arithmetic intensity, and why naive is still worth shipping
+
+A tile of `Tm` by `Tn` outputs loads `(Tm + Tn) * k` floats and does
+`2 * Tm * Tn * k` flops, so ignoring cache the intensity is
+
+```
+Tm * Tn / (2 * (Tm + Tn))   flop per byte
+```
+
+At 8 by 32 that is 3.2. The roofline knee on current cards sits between about 10
+and 80 flop per byte for fp32, so this kernel is memory bound everywhere, by a
+factor of three at the low end.
+
+The gap that justifies the tiled milestone shows up at long prefill. At 1024
+tokens the `attn.qkv` call is 3.62 GFLOP against 19.7 MiB of distinct operand
+data, an achievable 184 flop per byte. The naive kernel launches 9216 blocks that
+between them pull 1.13 GiB, which is 57 times the traffic the arithmetic needs.
+
+The gap at short prefill is the surprise, and it is worth knowing before anyone
+optimises the wrong thing. At 8 tokens the same call touches 7.08 MiB of weight
+for 28 MFLOP, so a perfect GEMM reaches 4 flop per byte and the naive kernel
+already reaches 3.2. Tiling buys almost nothing there. At decode, `m` is 1, the
+GEMM is a GEMV, and the intensity is 0.5 flop per byte no matter what any kernel
+does: the whole weight has to cross the bus to produce one output row. The fixes
+for decode are a smaller dtype and batching, not a better tile.
+
+### fmaf, and where the bias goes
+
+The inner loop uses `fmaf` rather than `a * b + acc`, matching `dot4` in
+`device_ops.cuh`. Two reasons. The numerics stop depending on whether the
+compiler contracts the pair, and one rounding per term instead of two roughly
+halves the accumulated error, which is worth having at `k = 3072`.
+
+The bias is added once at the end, outside the reduction. Seeding the accumulator
+with it instead would put it at the head of a 3072-long dependency chain and
+round it 3072 times rather than once. `bias` may be null, and the branch is
+uniform across the entire grid, so it costs nothing.
+
+### The absolute tolerance has to be derived
+
+`Tolerance::gemm()` is `{2e-5 relative, 1e-6 absolute}`. The relative half is
+right. The absolute half fails a correct kernel, and this is the third kernel in
+this file where that happens.
+
+A dot product of `k` terms accumulates absolute error set by the size of its
+partial sums, not by the size of its result. Summing sequentially rounds once per
+step against the partial sum `S_j`, and those roundings add as a random walk, so
+
+```
+floor = eps * sqrt( sum_j S_j² )       eps = 2^-24
+```
+
+When the terms are zero-mean the partial sums wander to about `sqrt(j)` and the
+result lands near `sqrt(k)`, while the error keeps growing with `k`. Outputs that
+cancel down to near zero are correct to every bit they are entitled to and still
+miss a flat 1e-6 by an order of magnitude.
+
+Measured against a sequential `fmaf` reference, the flat budget fails five of the
+ten synthetic shapes in `tests/test_gemm.cu`. The `mlp.proj` shape puts 110 of
+6144 outputs outside it, the worst by 18x.
+
+The floor above costs one multiply-add per element to track, since the oracle is
+already walking `j`. Measured worst-case error lands between 0.4 and 1.2 times
+it across every shape tested, so the 10x margin the test applies is a margin.
+The worst case in the suite then sits at 7% of its budget, and a transposed
+operand or a dropped term misses by the magnitude of the result itself, four
+orders above.
+
+### The output head is the transposed case
+
+`lm_head` ties to `wte`, which is `[n_vocab, d_model]`, so the logits contract
+against a stored row rather than a stored column. That needs a transposed-`B`
+variant and arrives with the end-to-end logit test, where there is something to
+check it against.
+
+### Optimisation ladder
+
+| Version | flop per byte of tile load | Status |
+| --- | --- | --- |
+| Naive, 8 by 32, one thread per output | 3.2 | done |
+| Shared-memory tile, 32 by 32 | 8 | not started |
+| Register blocked, 64 by 64 at 4 by 4 per thread | 16 | not started |
+| 128 by 128 with float4 loads and a double-buffered tile | 32 | not started |
+| Fused bias, GELU and residual epilogues | no change | not started |
+
+The column ignores L2, which recovers a real share of the repeated loads, so
+measured numbers should beat it. The ordering is what the column is for.
+
+The epilogue row changes no intensity and still matters. Folding the bias, the
+GELU and the residual add into the GEMM that produces their input removes three
+full read-write cycles over the activation per block, twenty-four times per
+forward pass, and those kernels are pure bandwidth.
+
+Numbers go here once each version runs on hardware.
