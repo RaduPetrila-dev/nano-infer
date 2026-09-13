@@ -18,8 +18,8 @@ baseline is not a measurement.
 | LayerNorm, naive | done |
 | GELU, embedding, residual | done |
 | GEMM, naive | done |
-| Attention, unfused | next |
-| End-to-end logit parity with HuggingFace | not started |
+| Attention, unfused | done |
+| End-to-end logit parity with HuggingFace | next |
 | BPE tokeniser | not started |
 | KV cache and sampling | not started |
 | GEMM, tiled and register-blocked | not started |
@@ -96,6 +96,11 @@ checked by running `h.0.mlp.fc.out` through the kernel and comparing against
 parity case yet, because the dump saves LayerNorm gamma and beta but not `wte`
 or `wpe`. It arrives with the end-to-end test, which loads the checkpoint.
 
+Attention gets parity for free as well, and needs no flags. `h.0.attn.qkv.out`
+is the packed `[Q | K | V]` the kernel consumes, `h.0.attn.probs` is the
+probability matrix it produces, and `h.0.attn.proj.in` is the merged head output
+the projection reads, which is the attention result by construction.
+
 GEMM needs the `Conv1D` weights, which the dump writes only when asked:
 
 ```bash
@@ -122,6 +127,7 @@ include/nanoinfer/       public interface of the static library
     embedding.cuh
     residual.cuh
     gemm.cuh
+    attention.cuh
 src/                     implementation, kernels/ holds the .cu files
 tests/                   npy.hpp, reference.hpp, one test per kernel
 tools/                   export_gpt2.py, dump_reference.py
