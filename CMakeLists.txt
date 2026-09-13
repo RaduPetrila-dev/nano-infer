@@ -35,6 +35,7 @@ add_library(nanoinfer_core STATIC
   src/kernels/embedding.cu
   src/kernels/residual.cu
   src/kernels/gemm.cu
+  src/kernels/attention.cu
 )
 
 target_include_directories(nanoinfer_core PUBLIC
