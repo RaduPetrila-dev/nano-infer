@@ -1,3 +1,4 @@
+# Destination: CMakeLists.txt (repository root)
 cmake_minimum_required(VERSION 3.24)
 
 project(nano_infer
@@ -33,6 +34,7 @@ add_library(nanoinfer_core STATIC
   src/kernels/gelu.cu
   src/kernels/embedding.cu
   src/kernels/residual.cu
+  src/kernels/gemm.cu
 )
 
 target_include_directories(nanoinfer_core PUBLIC
