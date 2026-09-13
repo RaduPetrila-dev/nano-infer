@@ -11,6 +11,12 @@ files later, with no way to tell which layer introduced the error.
 Determinism matters more than realism here. The prompt is fixed, dropout is off
 in eval mode, and the model runs under no_grad on CPU in float32. Run this on
 two machines and you get byte-identical files.
+
+Conv1D weights stay out of the dump by default, since each one is up to 9 MiB
+and the same numbers already live in the exported .bin. Pass --dump-weights when
+you need them, which the GEMM parity test does: it feeds a real activation
+through a real weight and checks the result against what the Conv1D produced.
+Layers 0 and 11 with weights cost about 85 MiB. The directory is gitignored.
 """
 
 from __future__ import annotations
@@ -92,9 +98,11 @@ def to_array(value):
     return np.ascontiguousarray(value.detach().to(torch.float32).cpu().numpy())
 
 
-def dump(model_name: str, out_dir: Path, prompt: str, layer_spec: str) -> None:
+def dump(model_name: str, out_dir: Path, prompt: str, layer_spec: str,
+         dump_weights: bool) -> None:
     import torch
     from transformers import GPT2LMHeadModel, GPT2TokenizerFast
+    from transformers.pytorch_utils import Conv1D
 
     print(f"loading {model_name}", file=sys.stderr)
     tokenizer = GPT2TokenizerFast.from_pretrained(model_name)
@@ -156,13 +164,21 @@ def dump(model_name: str, out_dir: Path, prompt: str, layer_spec: str) -> None:
             save(f"{name}.in", to_array(inputs[0]))
         save(f"{name}.out", to_array(output))
 
-        # LayerNorm gamma and beta, so the kernel test needs only this dump and
-        # not the exported checkpoint as well. Restricted to LayerNorm on
-        # purpose: a Conv1D weight is 7 MiB and already lives in the .bin.
+        # LayerNorm gamma and beta are always saved. They are a few kilobytes,
+        # and without them the LayerNorm test would need the exported checkpoint
+        # as well as this dump.
         module = module_by_name.get(name)
         if isinstance(module, torch.nn.LayerNorm):
             save(f"{name}.gamma", to_array(module.weight))
             save(f"{name}.beta", to_array(module.bias))
+
+        # Conv1D stores [in_features, out_features] and computes y = x @ W, the
+        # layout the GEMM kernel consumes. Saved untransposed on purpose: a
+        # parity test that transposed on the way in could not catch a kernel
+        # that transposes on the way out.
+        if dump_weights and isinstance(module, Conv1D):
+            save(f"{name}.w", to_array(module.weight))
+            save(f"{name}.b", to_array(module.bias))
 
     # Attention probabilities, post-softmax and post-mask, shaped
     # [batch, heads, query, key]. The single most useful tensor for debugging a
@@ -184,6 +200,7 @@ def dump(model_name: str, out_dir: Path, prompt: str, layer_spec: str) -> None:
         "n_ctx": cfg.n_positions,
         "n_vocab": cfg.vocab_size,
         "layers_dumped": layers,
+        "weights_dumped": dump_weights,
         "torch_version": torch.__version__,
         "tensors": saved,
     }
@@ -209,9 +226,15 @@ def main() -> int:
         default="0,-1",
         help="comma-separated layer indices, negatives count from the end, or 'all'",
     )
+    parser.add_argument(
+        "--dump-weights",
+        action="store_true",
+        help="also save the Conv1D weight and bias for each dumped layer, "
+        "about 28 MiB per layer, needed by the GEMM parity test",
+    )
     args = parser.parse_args()
 
-    dump(args.model, args.out, args.prompt, args.layers)
+    dump(args.model, args.out, args.prompt, args.layers, args.dump_weights)
     return 0
 
 
