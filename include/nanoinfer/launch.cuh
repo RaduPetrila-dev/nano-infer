@@ -25,6 +25,12 @@ constexpr int kBlockThreads = 256;
 // stride tail stays one extra iteration.
 constexpr int kMaxGridBlocks = 4096;
 
+// Block tile for the naive GEMM. One warp wide, so the 32 lanes cover 128
+// consecutive bytes of a B row and the load retires as one transaction. Eight
+// rows stack eight warps to reach kBlockThreads.
+constexpr int kGemmTileN = kWarpSize;                     // 32
+constexpr int kGemmTileM = kBlockThreads / kGemmTileN;    // 8
+
 // Threads for a kernel that gives one block to a row and strides across it.
 // Rows narrower than a block round up to a warp multiple, since a partial warp
 // wastes lanes inside every shuffle.
