@@ -438,3 +438,156 @@ full read-write cycles over the activation per block, twenty-four times per
 forward pass, and those kernels are pure bandwidth.
 
 Numbers go here once each version runs on hardware.
+
+## Attention, unfused
+
+```
+S[h][i][j] = (Q[i][h] · K[j][h]) / sqrt(head_dim)   for j <= i, masked otherwise
+P[h][i]    = softmax(S[h][i])
+O[i][h]    = Σ_j P[h][i][j] · V[j][h]
+```
+
+Heads never interact, so `h` is a grid dimension and never a loop.
+
+### Three kernels, one matrix
+
+QKᵀ, the row softmax and the value sum run as three launches with the score
+matrix written to global memory between them. Fusing them is the endpoint, not
+the start. The unfused version exists because it is the only one that can be
+checked a stage at a time: `attention_scores` alone produces a matrix you can
+diff against `h.0.attn.probs` before the softmax has touched it, and a fused
+kernel that is wrong gives you one number and no way in.
+
+It is also the baseline. A fused attention kernel with no unfused measurement
+next to it is a claim, not a result.
+
+### Pointers and strides, not one tensor
+
+The QKV projection writes one row of `[Q | K | V]`, 2304 wide for the 124M
+model. A KV cache stores K and V on their own, 768 wide, and Q arrives from a
+different allocation entirely. Those are the same computation with different
+strides, so `AttentionShape` carries a base pointer and a row stride per operand
+instead of assuming the packed layout. `AttentionShape::packed` builds the
+prefill case, and decode changes three integers rather than forking the kernels.
+
+### The scale goes before the softmax
+
+`1 / sqrt(head_dim)` multiplies the scores, not the probabilities. Softmax is
+invariant under an additive shift and not under a multiplicative one, so moving
+the factor past it changes the distribution. At `head_dim` 64 the factor is
+0.125, a power of two and exact in fp32.
+
+### The mask, and the half that is never computed
+
+Query row `r` sits at absolute position `pos_offset + r` and sees keys `0`
+through `pos_offset + r`. Prefill passes offset 0. Decode passes one query row
+with the offset set to the cache length, and the same expression covers both.
+Without the offset every decode step attends to key 0 alone, which is the same
+class of bug `pos_offset` exists to prevent in the embedding kernel.
+
+The score kernel writes `-inf` into masked positions so the intermediate matrix
+is defined everywhere and worth dumping. The softmax overwrites those with exact
+zeros, matching what HuggingFace reports, and both later kernels stop their loops
+at the row's visible length. Storage is square, work is triangular.
+
+An off-by-one here is the cheapest line in the file to get wrong. Admitting one
+future key shifts a prefill row by a fraction of a percent, which reads as
+accumulated error rather than as a bug, and it disappears entirely during decode
+because there is no future key to leak. `tests/test_attention.cu` checks the mask
+structurally, not through a tolerance: masked weights must be exactly zero and
+every row must sum to one.
+
+### The max subtraction is not optional
+
+`expf` overflows in fp32 above `ln(FLT_MAX)`, which is 88.72. GPT-2 scores pass
+that on real prompts, and an overflowed row computes `inf / inf` and returns NaN
+across every key. Subtracting the row max bounds every exponent at zero. The
+largest term becomes exactly 1 and the smallest underflows to zero, which is the
+right answer for a term the denominator was going to ignore.
+
+The cost is one extra block reduction. The `overflow_2h_6x64` case builds scores
+of exactly 96.0 to 103.5 from dyadic constants, so the dot product is
+bit-identical in fp32 and in the double oracle and the only thing under test is
+the subtraction. Remove it and the case returns NaN for most of the matrix.
+
+### One warp per key
+
+The score kernel gives a block to each `(query, head)` and a warp to each key.
+Lanes stride the head dimension, so the 32 addresses a warp issues are
+contiguous and the load retires as one transaction. One thread per key instead
+puts neighbouring threads a full row apart, 9216 bytes for a packed row, and
+turns each load into 32 separate transactions.
+
+The key loop is `for (key = warp; key < n_key; key += warps)`. The bound depends
+on the warp index and never on the lane, so all 32 lanes make the same number of
+trips. `warp_reduce_sum` shuffles under the full mask and reads undefined data
+from any lane that left early, which is the failure mode a lane-dependent bound
+would produce: no error, no hang, just a wrong sum on the tail warp.
+
+The query row stages into dynamic shared memory once per block, since all eight
+warps read it and it is 256 bytes at `head_dim` 64.
+
+### Reduction identities
+
+The softmax kernel runs one block per row and reuses one shared array for the
+max and the sum, which `block_reduce_sum` already supports through its second
+barrier.
+
+`block_reduce_max` seeds lanes past the warp count with `-FLT_MAX` rather than
+`-inf`. A row with no visible key would take that finite value as its maximum,
+exponentiate to zero, and divide by a zero sum. Causal masking puts the diagonal
+in every row, so the case cannot arise, and `attention_validate` rejects any
+shape where `n_key` fails to reach the last query position rather than leaving
+the invariant implicit.
+
+### The context kernel
+
+One block per `(query, head)`, one thread per output channel, each thread
+walking the visible keys. Neighbouring threads read neighbouring channels of the
+same value row, so the loads coalesce and the probability broadcasts across the
+block. At `head_dim` 64 the block is two warps, which is thin, and the grid is
+`n_query * n_head` blocks, which is not. The optimised version splits the keys
+across warps and reduces, which only pays once the kernel stops being a naive
+baseline.
+
+### What the matrix costs
+
+The score buffer is `n_head * n_query * n_key` floats. At full context that is
+12 · 1024 · 1024 · 4 bytes, 48 MiB per sequence, written once and read twice.
+Weights are 475 MiB in fp32, so one sequence at full context adds a tenth of the
+model again in scratch, and every byte of it exists only to be read back twice.
+That is the argument for flash attention in one line.
+
+### Parity is the only check on the head layout
+
+Nothing reshapes. A head is the column offset `h * head_dim` into a row, so
+splitting the heads and merging them again are both address arithmetic and
+neither moves a byte, which keeps the repo's claim that nothing is transposed
+anywhere true here too.
+
+A synthetic case reads back whatever layout it wrote, so it cannot catch heads
+sliced the wrong way. Contiguous slices of the row against an interleaved
+reading are both self-consistent and only one matches `Conv1D`. The layer 0
+parity case is what settles it, the same argument that makes the GEMM parity
+case the only check on the weight transpose.
+
+### The decode problem
+
+Decode gives `n_query` 1, so the grid is `n_head` blocks and the device sits
+idle in exactly the way LayerNorm does at one row. The fix is the same: fuse the
+stages so one launch does the work, and capture the step in a CUDA graph to drop
+the per-launch cost. Neither belongs before the engine runs end to end.
+
+### Optimisation ladder
+
+| Version | Passes over the score matrix | Status |
+| --- | --- | --- |
+| Three kernels, matrix in global memory | 3 | done |
+| float4 loads in the dot product and the value sum | 3 | not started |
+| Softmax fused into the score kernel, matrix tiled in shared memory | 1 | not started |
+| Online softmax, matrix never leaves registers | 0 | not started |
+
+The last row is flash attention. It removes the 48 MiB and the two extra passes
+together, and it is the reason this version keeps its numbers.
+
+Numbers go here once each version runs on hardware.
