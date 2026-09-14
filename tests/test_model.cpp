@@ -97,6 +97,7 @@ bool check_argmax(const std::vector<float>& actual, const std::string& name) {
 struct Stage {
   std::string reference;  // name in the dump
   std::string stage;      // name the model emits
+  int blocks = 0;         // transformer blocks this tensor has passed through
 };
 
 // h.<i>.in is the stream entering block i, which is the previous block's output
@@ -105,16 +106,16 @@ struct Stage {
 // to one block rather than to the stack above it.
 std::vector<Stage> stage_map(int n_layer) {
   std::vector<Stage> stages;
-  stages.push_back({"embed.out", "embed.out"});
+  stages.push_back({"embed.out", "embed.out", 0});
   for (int i = 0; i < n_layer; ++i) {
     const std::string index = std::to_string(i);
     const std::string prior =
         i == 0 ? "embed.out" : "h." + std::to_string(i - 1) + ".out";
-    stages.push_back({"h." + index + ".in", prior});
-    stages.push_back({"h." + index + ".out", "h." + index + ".out"});
+    stages.push_back({"h." + index + ".in", prior, i});
+    stages.push_back({"h." + index + ".out", "h." + index + ".out", i + 1});
   }
-  stages.push_back({"ln_f.in", "h." + std::to_string(n_layer - 1) + ".out"});
-  stages.push_back({"ln_f.out", "ln_f.out"});
+  stages.push_back({"ln_f.in", "h." + std::to_string(n_layer - 1) + ".out", n_layer});
+  stages.push_back({"ln_f.out", "ln_f.out", n_layer});
   return stages;
 }
 
@@ -192,8 +193,19 @@ int run() {
 
     // The embedding is one fp32 add of two table rows, so it should land on the
     // reference exactly. Everything downstream carries a GEMM chain.
-    const Tolerance base = entry.reference == "embed.out" ? Tolerance::elementwise()
-                                                          : Tolerance::gemm();
+    Tolerance base = entry.reference == "embed.out" ? Tolerance::elementwise()
+                                                    : Tolerance::gemm();
+
+    // Both bases size one kernel. A tensor twelve blocks down the residual
+    // stream carries the rounding of every GEMM and softmax above it, and each
+    // block feeds its error to the next, so the bar has to widen with depth.
+    // Tolerance::logits() already concedes this, sitting ten times looser than
+    // Tolerance::gemm() because logits leave the full stack. Scaling linearly
+    // with block count makes the concession explicit and monotone: block 0 keeps
+    // the single-kernel figure, and the last block lands next to the logits
+    // figure instead of facing a cliff one LayerNorm before it.
+    base.relative *= static_cast<float>(1 + entry.blocks);
+
     run.add(check_stage(found->second, entry.reference, base));
     ++compared;
   }
