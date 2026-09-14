@@ -30,6 +30,7 @@ option(NANOINFER_LINEINFO "Emit line info for Nsight Compute source view" ON)
 
 add_library(nanoinfer_core STATIC
   src/weights.cpp
+  src/model.cpp
   src/kernels/layernorm.cu
   src/kernels/gelu.cu
   src/kernels/embedding.cu

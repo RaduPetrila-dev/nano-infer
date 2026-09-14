@@ -2,8 +2,11 @@
 # absolute path to the reference data so tests work from any build directory.
 add_library(nanoinfer_test_support INTERFACE)
 target_include_directories(nanoinfer_test_support INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+# The end-to-end test needs the exported checkpoint as well as the dump, and
+# both live outside the build tree.
 target_compile_definitions(nanoinfer_test_support INTERFACE
-  NANOINFER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+  NANOINFER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
+  NANOINFER_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/weights")
 target_link_libraries(nanoinfer_test_support INTERFACE nanoinfer_core)
 
 function(nanoinfer_add_test name source)
@@ -21,3 +24,4 @@ nanoinfer_add_test(test_embedding test_embedding.cu)
 nanoinfer_add_test(test_residual test_residual.cu)
 nanoinfer_add_test(test_gemm test_gemm.cu)
 nanoinfer_add_test(test_attention test_attention.cu)
+nanoinfer_add_test(test_model test_model.cpp)
