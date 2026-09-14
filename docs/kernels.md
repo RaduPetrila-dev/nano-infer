@@ -412,12 +412,31 @@ The worst case in the suite then sits at 7% of its budget, and a transposed
 operand or a dropped term misses by the magnitude of the result itself, four
 orders above.
 
-### The output head is the transposed case
+### The output head contracts along a row
 
 `lm_head` ties to `wte`, which is `[n_vocab, d_model]`, so the logits contract
-against a stored row rather than a stored column. That needs a transposed-`B`
-variant and arrives with the end-to-end logit test, where there is something to
-check it against.
+against a stored row rather than a stored column. `gemm_forward_bt` is that call.
+Nothing transposes the weight, here or anywhere else in the repo.
+
+The thread mapping changes with it. `gemm_kernel` gives a thread to an output and
+walks `B` down a column, which is contiguous when `B` is `[k, n]` and a stride of
+`k` when it is `[n, k]`. Neighbouring threads would then land 3072 bytes apart
+and split one transaction into 32.
+
+`gemm_bt_kernel` gives a warp to an output instead and strides the reduction axis
+across its lanes, so both operands are read along `k` and both coalesce. `A` is
+not staged in shared memory: every warp in the block reads the same row, and at
+`k = 768` that is 3 KiB served from L1 rather than a staging copy worth writing.
+
+Two consequences follow. The reduction is a per-lane strided sum closed by a
+butterfly, which rounds at least as well as the sequential pass the tolerance
+floor assumes, so the floor still bounds it. And `B` is re-read once per token,
+154 MiB per row at the real vocabulary, which is what the first optimisation on
+the ladder removes by holding a weight tile across the token dimension.
+
+The head is worth the attention. At a prompt of 11 tokens it is 31% of the
+forward pass in flop terms, and during generation every row but the last is
+discarded.
 
 ### Optimisation ladder
 
