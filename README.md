@@ -257,16 +257,95 @@ as `numpy.allclose`. Pure relative error explodes near zero and post-LayerNorm
 activations sit near zero constantly. Pure absolute error is scale-dependent,
 and logits reach magnitude 100 while normalised activations sit near 1.
 
+The end-to-end test scales the relative term with depth, because a tensor twelve
+blocks down the residual stream carries the rounding of every GEMM and softmax
+above it and each block hands its error to the next. Block 0 keeps the
+single-kernel GEMM figure, and the last block lands next to the logits figure
+instead of facing a cliff one LayerNorm before it. Holding the last block to the
+single-kernel number while accepting 2e-4 for the logits it feeds was the
+inconsistency this replaces.
+
 Failures report the worst element ranked by how far past its budget it sits,
 with the row and column, not just the flat index. Kernel bugs cluster on an
 axis: a whole bad row means the block is wrong, a whole bad column means the
 lane is, a scattered handful means a race.
 
-## Benchmarks
+## Baseline
 
-Empty until the kernels exist. The table will carry naive, optimised, and
-llama.cpp on the same card, with Nsight Compute occupancy and memory throughput
-per kernel recorded in `docs/profiling.md`.
+Measured before any optimisation. Both numbers get kept, so these stay in place
+as the optimised kernels land.
+
+512-token prefill, GPT-2 124M, fp32, one NVIDIA A100-SXM4-80GB (sm_80, 108 SMs)
+on the University of Manchester CSF3. CUDA 12.6.2, GCC 11.5.0, CMake 3.26.5,
+`-DCMAKE_CUDA_ARCHITECTURES=80`, commit `69ed711`. All eight tests pass on this
+hardware. Kernel times from `nsys`, median of five runs for the two GEMMs, single
+run for the rest.
+
+| Kernel | Time (ms) | Share | Launches |
+| --- | --- | --- | --- |
+| `gemm_bt` (lm_head) | 45.545 | 57.9% | 1 |
+| `gemm` (block projections) | 27.412 | 34.8% | 48 |
+| `scores` | 3.903 | 5.0% | 12 |
+| `context` | 1.020 | 1.3% | 12 |
+| `softmax` | 0.406 | 0.5% | 12 |
+| `layernorm` | 0.153 | 0.2% | 25 |
+| `gelu` | 0.150 | 0.2% | 12 |
+| `residual` | 0.126 | 0.2% | 24 |
+| `embedding` | 0.008 | <0.1% | 1 |
+| Total | 78.72 | | 147 |
+
+Run-to-run spread across the five runs was 0.03% on `gemm_bt` and 0.22% on
+`gemm`. GPU clocks are not locked, since `nvidia-smi -lgc` needs root and this is
+a shared facility, so a few percent of drift between sessions is expected.
+
+Nsight Compute on the `mlp.proj` shape, m = 512, n = 768, k = 3072, grid
+(24, 64, 1) and block (32, 8, 1), duration 835 us:
+
+| Metric | Value |
+| --- | --- |
+| L1/TEX throughput | 70.1% |
+| SM throughput | 65.2% |
+| DRAM throughput | 1.0% |
+| L1 hit rate | 90.3% |
+| L2 hit rate | 96.6% |
+| Achieved occupancy | 84.0% |
+
+The naive GEMM is cache bound on load issue, not DRAM bound. Every value it
+loads feeds exactly one output, so the limit is how fast loads can be issued
+rather than how fast memory can supply them. Arithmetic intensity is the lever,
+which is what shared-memory tiling and register blocking buy. Occupancy at 84%
+is not the constraint.
+
+Correctness at 5 tokens, ids `464 3139 286 4881 318`, is a separate run. The
+512-token figures above are timing only: the ids are `i % 50257` and the output
+carries no meaning.
+
+Profiling detail per kernel goes in `docs/profiling.md` as the optimisation
+ladder is climbed. Comparison against llama.cpp waits until it has been run on
+this same card.
+
+## Known inefficiencies
+
+Named here rather than buried, since each one is measured and none is fixed yet.
+
+Prefill computes logits at every position and reads one. The head is 57.9% of
+runtime at 512 tokens. Restricting it to the final row removes almost all of
+that, and the all-rows path stays behind a flag because `test_model` compares
+every position.
+
+`gemm_bt` gives one warp per output element, so each output reads a full
+k-length row of B and nothing is reused across rows. The kernel scaled 105x for
+102x the tokens, which is the signature of zero reuse. Row tiling in shared
+memory cuts the redundant traffic by the tile factor.
+
+`gemm` is the same mapping problem one level down: one thread per output, each
+walking k alone. Parallelism is tied to n while k stays serial, so narrow shapes
+collapse. At m = 512 the n = 768 projections run 4x slower than the n = 3072 one
+doing identical work.
+
+`scores_kernel` is quadratic in sequence length: 3.2 us at 5 tokens, 325 us at
+512. Invisible at this context, dominant at 2048. This is the case for fusing
+attention with an online softmax.
 
 ## Licence
 
