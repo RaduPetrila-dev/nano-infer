@@ -106,7 +106,7 @@ def dump(model_name: str, out_dir: Path, prompt: str, layer_spec: str,
 
     print(f"loading {model_name}", file=sys.stderr)
     tokenizer = GPT2TokenizerFast.from_pretrained(model_name)
-    model = GPT2LMHeadModel.from_pretrained(model_name, torch_dtype=torch.float32)
+    model = GPT2LMHeadModel.from_pretrained(model_name, torch_dtype=torch.float32, attn_implementation="eager")
     # eval() disables dropout. Without this the reference changes every run and
     # every kernel test becomes flaky.
     model.eval()
