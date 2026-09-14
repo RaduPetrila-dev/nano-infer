@@ -24,13 +24,24 @@ namespace nanoinfer {
 //   mlp.fc     [t, 768]  * [768, 3072]
 //   mlp.proj   [t, 3072] * [3072, 768]
 //
-// The output head is the one call that contracts against a stored row rather
-// than a column, since lm_head ties to wte and wte is [n_vocab, d_model]. That
-// needs a transposed-B variant and arrives with the end-to-end logit test.
-//
 // Degenerate dimensions return without launching. Launch is asynchronous.
 // Synchronise the stream before reading `c` on the host.
 void gemm_forward(float* c, const float* a, const float* b, const float* bias,
                   int m, int n, int k, cudaStream_t stream);
+
+// C[m, n] = A[m, k] * B[n, k]ᵀ + bias[n]
+//
+// The output head, and the one call that contracts along a stored row instead
+// of a stored column. lm_head ties to wte, which is [n_vocab, d_model], so the
+// weight arrives with its output axis first and nothing transposes it.
+//
+//   c     [m, n]  must not alias a, b or bias
+//   a     [m, k]  activations, m = tokens
+//   b     [n, k]  one contiguous row per output column
+//   bias  [n]     optional, pass nullptr to skip it. The head has none.
+//
+// Same contract as gemm_forward otherwise.
+void gemm_forward_bt(float* c, const float* a, const float* b, const float* bias,
+                     int m, int n, int k, cudaStream_t stream);
 
 }  // namespace nanoinfer
