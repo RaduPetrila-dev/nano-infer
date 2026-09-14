@@ -105,20 +105,25 @@ std::vector<float> run_kernel(Launcher launch, const std::vector<float>& a,
   DeviceBuffer<float> d_bias;
   if (bias != nullptr) d_bias.allocate(bias->size());
 
-  CUDA_CHECK(cudaMemcpy(d_a.get(), a.data(), d_a.bytes(), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_b.get(), b.data(), d_b.bytes(), cudaMemcpyHostToDevice));
-  if (bias != nullptr) {
-    CUDA_CHECK(cudaMemcpy(d_bias.get(), bias->data(), d_bias.bytes(),
-                          cudaMemcpyHostToDevice));
-  }
-
+  // Every transfer and fill below is issued on the launch stream. A blocking
+  // cudaMemcpy from pageable host memory returns once the source is staged for
+  // DMA, not once the device holds the data, and it rides the legacy default
+  // stream, which a non-blocking stream never synchronises with. The kernel
+  // would read whatever had landed by the time it started.
   CudaStream stream;
 
+  CUDA_CHECK(cudaMemcpyAsync(d_a.get(), a.data(), d_a.bytes(),
+                             cudaMemcpyHostToDevice, stream.get()));
+  CUDA_CHECK(cudaMemcpyAsync(d_b.get(), b.data(), d_b.bytes(),
+                             cudaMemcpyHostToDevice, stream.get()));
+  if (bias != nullptr) {
+    CUDA_CHECK(cudaMemcpyAsync(d_bias.get(), bias->data(), d_bias.bytes(),
+                               cudaMemcpyHostToDevice, stream.get()));
+  }
+
   // Poison, so an edge tile that writes nothing fails instead of inheriting the
-  // previous case's answer. Issued on the launch stream, not the default one. A
-  // plain cudaMemset is asynchronous for device memory and runs on the legacy
-  // default stream, which a non-blocking stream never synchronises with, so it
-  // is free to land after the kernel and overwrite every output.
+  // previous case's answer. Ordered against the launch for the same reason as
+  // the copies above.
   CUDA_CHECK(cudaMemsetAsync(d_c.get(), 0x7f, d_c.bytes(), stream.get()));
 
   launch(d_c.get(), d_a.get(), d_b.get(),
