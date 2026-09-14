@@ -19,8 +19,8 @@ baseline is not a measurement.
 | GELU, embedding, residual | done |
 | GEMM, naive | done |
 | Attention, unfused | done |
-| End-to-end logit parity with HuggingFace | next |
-| BPE tokeniser | not started |
+| End-to-end logit parity with HuggingFace | done |
+| BPE tokeniser | next |
 | KV cache and sampling | not started |
 | GEMM, tiled and register-blocked | not started |
 | Attention, fused with online softmax | not started |
@@ -67,6 +67,14 @@ python tools/export_gpt2.py --model gpt2 --out weights/gpt2-124m-f32.bin
 ./build/nano-infer weights/gpt2-124m-f32.bin
 ```
 
+Pass token ids after the checkpoint to run one prefill pass and print the top
+five next tokens. Ids and not text, since the BPE tokeniser is a later
+milestone.
+
+```bash
+./build/nano-infer weights/gpt2-124m-f32.bin 464 3139 286 4881 318
+```
+
 The CPU-only torch wheel is deliberate. Weight export and the reference dump both
 run on CPU, and the default wheel bundles a 2.5 GB NVIDIA runtime neither needs.
 
@@ -88,7 +96,9 @@ accumulates up the stack, which covers almost every case. Use `--layers all`
 when a bug appears halfway.
 
 The data is gitignored. Tests that need it exit 77, which `ctest` records as a
-skip rather than a failure, so a fresh clone is never red.
+skip rather than a failure, so a fresh clone is never red. `test_model` needs the
+exported checkpoint as well and skips without it, or reads `NANOINFER_CHECKPOINT`
+when the file sits somewhere else.
 
 Some kernels get parity for free from tensors the dump already holds. GELU is
 checked by running `h.0.mlp.fc.out` through the kernel and comparing against
@@ -119,6 +129,7 @@ include/nanoinfer/       public interface of the static library
   config.hpp             model dimensions, checkpoint format
   cuda_utils.hpp         RAII for device memory, pinned memory, streams, events
   weights.hpp            loader interface
+  model.hpp              the forward pass
   device_ops.cuh         warp and block reductions, vectorised access
   launch.cuh             block and grid sizing shared by the launchers
   kernels/               launcher declarations
@@ -132,7 +143,7 @@ src/                     implementation, kernels/ holds the .cu files
 tests/                   npy.hpp, reference.hpp, one test per kernel
 tools/                   export_gpt2.py, dump_reference.py
 bench/                   microbenchmarks and tokens per second
-docs/                    kernels.md holds the design and numerical notes
+docs/                    kernels.md per kernel, forward.md for the wiring
 ```
 
 Headers mirror sources one to one. `.cuh` means the file contains device code or
@@ -169,6 +180,21 @@ malformed file costs nothing.
 
 The format is defined in `include/nanoinfer/config.hpp` and
 `tools/export_gpt2.py`. Both sides must change together.
+
+## Forward pass
+
+`src/model.cpp` wires the kernels into GPT-2. Pre-layer normalisation, two
+residual branches per block, one `ln_f`, and a head that reads `wte` back as its
+weight because `lm_head` ties to it.
+
+Activations live in one arena sized at construction, so a forward allocates
+nothing. `tests/test_model.cpp` runs the real prompt through the real checkpoint
+and compares the residual stream at every boundary the dump records before it
+looks at the logits, so a failure names the block rather than the stack. It also
+checks the argmax at every position, which is the only assertion here about what
+the model predicts rather than what it computes.
+
+Order, buffer plan and the tolerance rule live in `docs/forward.md`.
 
 ## Layout convention
 
