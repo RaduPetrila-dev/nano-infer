@@ -90,7 +90,12 @@ Tolerance gemm_tolerance(const Oracle& oracle) {
   return tol;
 }
 
-std::vector<float> run_kernel(const std::vector<float>& a,
+// Both launchers share a signature, so one runner serves both and the cases
+// below differ only in how b is laid out.
+using Launcher = void (*)(float*, const float*, const float*, const float*, int,
+                          int, int, cudaStream_t);
+
+std::vector<float> run_kernel(Launcher launch, const std::vector<float>& a,
                               const std::vector<float>& b,
                               const std::vector<float>* bias, int m, int n,
                               int k) {
@@ -112,8 +117,8 @@ std::vector<float> run_kernel(const std::vector<float>& a,
   CUDA_CHECK(cudaMemset(d_c.get(), 0x7f, d_c.bytes()));
 
   CudaStream stream;
-  gemm_forward(d_c.get(), d_a.get(), d_b.get(),
-               bias != nullptr ? d_bias.get() : nullptr, m, n, k, stream.get());
+  launch(d_c.get(), d_a.get(), d_b.get(),
+         bias != nullptr ? d_bias.get() : nullptr, m, n, k, stream.get());
   stream.sync();
 
   std::vector<float> out(d_c.count());
@@ -150,10 +155,72 @@ bool run_case(const Case& c) {
   const std::vector<float>* bias_ptr = c.with_bias ? &bias : nullptr;
 
   const Oracle oracle = gemm_cpu(a, b, bias_ptr, c.m, c.n, c.k);
-  const std::vector<float> actual = run_kernel(a, b, bias_ptr, c.m, c.n, c.k);
+  const std::vector<float> actual =
+      run_kernel(gemm_forward, a, b, bias_ptr, c.m, c.n, c.k);
 
   return report(c.name, compare(actual, oracle.values, gemm_tolerance(oracle)),
                 static_cast<std::size_t>(c.n));
+}
+
+// b arrives as [n, k] for the transposed launcher, one contiguous row per output
+// column. The oracle wants [k, n], so the test flips it on the host. A transpose
+// in the test cannot hide one in the kernel, since the agreement case below runs
+// both launchers over the same numbers in their own layouts.
+std::vector<float> transpose(const std::vector<float>& in, int rows, int cols) {
+  std::vector<float> out(in.size());
+  for (int r = 0; r < rows; ++r) {
+    for (int c = 0; c < cols; ++c) {
+      out[static_cast<std::size_t>(c) * rows + r] =
+          in[static_cast<std::size_t>(r) * cols + c];
+    }
+  }
+  return out;
+}
+
+bool run_bt_case(const Case& c) {
+  const std::vector<float> a =
+      gaussian(static_cast<std::size_t>(c.m) * c.k, c.a_spread, 1000u);
+  const std::vector<float> b =
+      gaussian(static_cast<std::size_t>(c.n) * c.k, c.b_spread, 2000u);
+  const std::vector<float> bias =
+      gaussian(static_cast<std::size_t>(c.n), 0.05f, 3000u);
+  const std::vector<float>* bias_ptr = c.with_bias ? &bias : nullptr;
+
+  const Oracle oracle =
+      gemm_cpu(a, transpose(b, c.n, c.k), bias_ptr, c.m, c.n, c.k);
+  const std::vector<float> actual =
+      run_kernel(gemm_forward_bt, a, b, bias_ptr, c.m, c.n, c.k);
+
+  return report(c.name, compare(actual, oracle.values, gemm_tolerance(oracle)),
+                static_cast<std::size_t>(c.n));
+}
+
+// The transposed launcher against the one the parity cases already cover, over
+// the same numbers in both layouts. Everything else here checks a kernel against
+// an oracle, which shares no code with either kernel but also shares no layout
+// convention with the checkpoint.
+bool run_bt_agreement() {
+  const int m = 8;
+  const int n = 768;
+  const int k = 768;
+
+  const std::vector<float> a = gaussian(static_cast<std::size_t>(m) * k, 1.0f, 11u);
+  const std::vector<float> b_kn =
+      gaussian(static_cast<std::size_t>(k) * n, 1.0f, 22u);
+  const std::vector<float> b_nk = transpose(b_kn, k, n);
+
+  const Oracle oracle = gemm_cpu(a, b_kn, nullptr, m, n, k);
+  const std::vector<float> straight =
+      run_kernel(gemm_forward, a, b_kn, nullptr, m, n, k);
+  const std::vector<float> transposed =
+      run_kernel(gemm_forward_bt, a, b_nk, nullptr, m, n, k);
+
+  const Tolerance tol = gemm_tolerance(oracle);
+  bool ok = report("bt_matches_oracle", compare(transposed, oracle.values, tol),
+                   static_cast<std::size_t>(n));
+  ok &= report("bt_matches_gemm", compare(transposed, straight, tol),
+               static_cast<std::size_t>(n));
+  return ok;
 }
 
 bool has_reference(const std::string& name) {
@@ -183,7 +250,7 @@ bool run_parity(const std::string& module) {
 
   const Oracle oracle = gemm_cpu(input.data, weight.data, &bias.data, m, n, k);
   const std::vector<float> actual =
-      run_kernel(input.data, weight.data, &bias.data, m, n, k);
+      run_kernel(gemm_forward, input.data, weight.data, &bias.data, m, n, k);
 
   // The reference is fp32 out of a blocked CPU GEMM, which sums more accurately
   // than a single sequential pass, so its own error sits inside the same floor.
@@ -197,10 +264,13 @@ bool run_degenerate() {
   cudaGetLastError();
   CudaStream stream;
 
-  gemm_forward(nullptr, nullptr, nullptr, nullptr, 0, 8, 8, stream.get());
-  gemm_forward(nullptr, nullptr, nullptr, nullptr, 8, 0, 8, stream.get());
-  gemm_forward(nullptr, nullptr, nullptr, nullptr, 8, 8, 0, stream.get());
-  gemm_forward(nullptr, nullptr, nullptr, nullptr, -1, 8, 8, stream.get());
+  const Launcher launchers[] = {gemm_forward, gemm_forward_bt};
+  for (Launcher launch : launchers) {
+    launch(nullptr, nullptr, nullptr, nullptr, 0, 8, 8, stream.get());
+    launch(nullptr, nullptr, nullptr, nullptr, 8, 0, 8, stream.get());
+    launch(nullptr, nullptr, nullptr, nullptr, 8, 8, 0, stream.get());
+    launch(nullptr, nullptr, nullptr, nullptr, -1, 8, 8, stream.get());
+  }
 
   const cudaError_t status = cudaGetLastError();
   if (status != cudaSuccess) {
@@ -240,6 +310,21 @@ int main() {
   };
 
   for (const Case& c : cases) run.add(run_case(c));
+
+  // The output head, which contracts along a stored row. The real head is
+  // n = 50257 and the end-to-end test covers that shape against HuggingFace.
+  const Case bt_cases[] = {
+      {"head_4x5000x768", 4, 5000, 768, 1.0f, 0.02f, false},
+      // Every dimension off the warp and the block tile.
+      {"bt_ragged_5x77x33", 5, 77, 33, 1.0f, 1.0f, true},
+      // k below one warp, so most lanes carry nothing into the shuffle.
+      {"bt_narrow_k_3x64x7", 3, 64, 7, 1.0f, 1.0f, true},
+      // The shortest legal reduction.
+      {"bt_k_is_one_4x64x1", 4, 64, 1, 1.0f, 1.0f, false},
+  };
+  for (const Case& c : bt_cases) run.add(run_bt_case(c));
+  run.add(run_bt_agreement());
+
   run.add(run_degenerate());
 
   // Parity needs the Conv1D weights, which the dump only writes when asked:
