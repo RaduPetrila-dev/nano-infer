@@ -112,11 +112,15 @@ std::vector<float> run_kernel(Launcher launch, const std::vector<float>& a,
                           cudaMemcpyHostToDevice));
   }
 
-  // Poison, so an edge tile that writes nothing fails instead of inheriting the
-  // previous case's answer.
-  CUDA_CHECK(cudaMemset(d_c.get(), 0x7f, d_c.bytes()));
-
   CudaStream stream;
+
+  // Poison, so an edge tile that writes nothing fails instead of inheriting the
+  // previous case's answer. Issued on the launch stream, not the default one. A
+  // plain cudaMemset is asynchronous for device memory and runs on the legacy
+  // default stream, which a non-blocking stream never synchronises with, so it
+  // is free to land after the kernel and overwrite every output.
+  CUDA_CHECK(cudaMemsetAsync(d_c.get(), 0x7f, d_c.bytes(), stream.get()));
+
   launch(d_c.get(), d_a.get(), d_b.get(),
          bias != nullptr ? d_bias.get() : nullptr, m, n, k, stream.get());
   stream.sync();
